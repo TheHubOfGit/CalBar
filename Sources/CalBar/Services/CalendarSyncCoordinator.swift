@@ -14,6 +14,8 @@ public enum MenuBarDisplayMode: String, CaseIterable, Identifiable, Codable {
     case iconOnly = "Calendar Icon"
     case iconWithDate = "Icon + Day of Month"
     case nextEvent = "Next Meeting Countdown"
+    case meetingsLeft = "Icon + Meetings Left Today"
+    case meetingsStacked = "Icon + Meetings Left / Time to Next"
 
     public var id: String { rawValue }
 }
@@ -25,15 +27,20 @@ public final class CalendarSyncCoordinator: ObservableObject {
     // Navigation & View Mode
     @Published public var selectedDate: Date = Date() {
         didSet {
+            guard !selectedDate.isSameDay(as: oldValue) else { return }
             Task { await fetchEventsForCurrentRange() }
         }
     }
-    @Published public var viewMode: ViewMode = .day {
-        didSet {
-            Task { await fetchEventsForCurrentRange() }
-        }
-    }
+    /// Day / Week never changes the fetched range, so switching modes does no network work.
+    @Published public var viewMode: ViewMode = .day
     @Published public var selectedEventForDetail: CalendarEvent? = nil
+
+    /// Monotonic token; bumped whenever the timeline should re-anchor its scroll position.
+    @Published public private(set) var scrollRequestToken: Int = 0
+
+    /// Cached start-of-today. Refreshed by the minute clock and by the system day-change
+    /// notification so views never have to recompute `Date().startOfDay()` while rendering.
+    @Published public private(set) var todayStart: Date = Date().startOfDay()
 
     // Sync State
     @Published public var syncProvider: SyncProvider = .sample {
@@ -45,7 +52,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
     @Published public var calendars: [CalendarItem] = []
     @Published public var events: [CalendarEvent] = [] {
         didSet {
-            updatePositionedEvents()
+            rebuildEventIndexes()
         }
     }
     @Published public var isSyncing: Bool = false
@@ -54,6 +61,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
 
     // Performance: Precomputed Layout Memoization (Zero CPU churn on scroll/render)
     @Published public private(set) var positionedEventsByDayKey: [String: [PositionedEvent]] = [:]
+    @Published public private(set) var allDayEventsByDayKey: [String: [CalendarEvent]] = [:]
 
     // Battery Optimization: Active Minute Clock (Suspended when popover is closed)
     @Published public var currentMinute: Double = Date().minuteOfDay
@@ -69,7 +77,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
     }
 
     // Preferences
-    @Published public var menuBarDisplayMode: MenuBarDisplayMode = .iconWithDate {
+    @Published public var menuBarDisplayMode: MenuBarDisplayMode = .meetingsLeft {
         didSet {
             UserDefaults.standard.set(menuBarDisplayMode.rawValue, forKey: "calbar_menu_display_mode")
             onMenuBarTitleChanged?(menuBarTitle)
@@ -78,7 +86,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
     @Published public var weekStartMonday: Bool = false {
         didSet {
             UserDefaults.standard.set(weekStartMonday, forKey: "calbar_week_start_monday")
-            Task { await fetchEventsForCurrentRange() }
+            Task { await fetchEventsForCurrentRange(force: true) }
         }
     }
     @Published public var refreshIntervalMinutes: Int = 5 {
@@ -167,15 +175,25 @@ public final class CalendarSyncCoordinator: ObservableObject {
     }
 
     public var currentWeekDays: [Date] {
+        let cal = Calendar.current
         let all7 = selectedDate.daysOfWeek(firstWeekday: weekStartMonday ? 2 : 1)
         if onlyShowWeekdays {
-            let cal = Calendar.current
             return all7.filter { date in
                 let wd = cal.component(.weekday, from: date)
                 return wd != 1 && wd != 7
             }
         }
         return all7
+    }
+
+    /// True when the currently selected date is the real-world today.
+    public var isShowingToday: Bool {
+        selectedDate.isSameDay(as: todayStart)
+    }
+
+    /// True when today falls inside the week currently rendered by the week view.
+    public var weekContainsToday: Bool {
+        currentWeekDays.contains { $0.isSameDay(as: todayStart) }
     }
 
     public func desiredPopoverSize() -> NSSize {
@@ -196,23 +214,67 @@ public final class CalendarSyncCoordinator: ObservableObject {
     }
 
     public func targetScrollHour(isToday: Bool) -> Int {
+        let clamp = { (hour: Int) in
+            max(self.timelineStartHour, min(self.timelineEndHour - 1, hour))
+        }
+
         switch scrollBehavior {
         case .currentTime:
-            if isToday {
-                let currentHour = Calendar.current.component(.hour, from: Date())
-                return max(timelineStartHour, min(timelineEndHour - 1, currentHour - 1))
-            } else {
-                return max(timelineStartHour, min(timelineEndHour - 1, 9))
-            }
+            guard isToday else { return clamp(9) }
+            // Keep one hour of context above "now" so the red line isn't glued to the top edge.
+            return clamp(Int(currentMinute / 60.0) - 1)
         case .specificTime:
-            return max(timelineStartHour, min(timelineEndHour - 1, specificScrollHour))
+            return clamp(specificScrollHour)
         case .retainPosition:
-            return max(timelineStartHour, min(timelineEndHour - 1, lastScrollHour))
+            return clamp(lastScrollHour)
         }
+    }
+
+    // MARK: - Popover Presentation
+    /// Called immediately before the popover is shown. Guarantees the popover always opens on
+    /// the real current day (the app is long-lived, so `selectedDate` goes stale overnight or
+    /// after the user navigates away) and re-anchors the timeline scroll position.
+    public func prepareForPopoverPresentation() {
+        refreshTodayIfNeeded()
+        currentMinute = Date().minuteOfDay
+
+        if !selectedDate.isSameDay(as: todayStart) {
+            selectedDate = Date()
+        }
+        requestScrollToTarget()
+    }
+
+    /// Opens the event detail sheet with a single, consistent animation.
+    public func present(_ event: CalendarEvent) {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.82)) {
+            selectedEventForDetail = event
+        }
+    }
+
+    public func dismissDetail() {
+        guard selectedEventForDetail != nil else { return }
+        withAnimation(.easeInOut(duration: 0.16)) {
+            selectedEventForDetail = nil
+        }
+    }
+
+    /// Asks the visible timeline to re-anchor itself on the next render pass.
+    public func requestScrollToTarget() {
+        scrollRequestToken &+= 1
+    }
+
+    @discardableResult
+    private func refreshTodayIfNeeded() -> Bool {
+        let start = Date().startOfDay()
+        guard start != todayStart else { return false }
+        todayStart = start
+        onMenuBarTitleChanged?(menuBarTitle)
+        return true
     }
 
     private var syncTimer: Timer?
     private var minuteTimer: Timer?
+    private var lastFetchedRange: (start: Date, end: Date)?
     private let authService = GoogleAuthService.shared
     private let calendarService = GoogleCalendarService.shared
     private let eventKitService = EventKitService.shared
@@ -260,22 +322,51 @@ public final class CalendarSyncCoordinator: ObservableObject {
             self.specificScrollHour = savedHour
         }
 
-        setupEventKitObservation()
+        setupObservers()
 
         // Initial fetch
         Task {
             await refreshAll()
             restartTimer()
+            startTitleTimer()
         }
     }
 
-    private func setupEventKitObservation() {
+    private func setupObservers() {
         NotificationCenter.default.publisher(for: .EKEventStoreChanged)
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 guard let self = self, self.syncProvider == .eventKit else { return }
                 Task { @MainActor in
-                    await self.fetchEventsForCurrentRange()
+                    await self.fetchEventsForCurrentRange(force: true)
+                }
+            }
+            .store(in: &cancellables)
+
+        // Midnight rollover: keep "today" (and the menu bar date) honest for a process that
+        // stays alive for days at a time.
+        NotificationCenter.default.publisher(for: .NSCalendarDayChanged)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                Task { @MainActor in
+                    guard let self = self else { return }
+                    self.refreshTodayIfNeeded()
+                    if self.isPopoverVisible {
+                        self.selectedDate = Date()
+                        self.requestScrollToTarget()
+                    }
+                }
+            }
+            .store(in: &cancellables)
+
+        // Waking from sleep can skip the day-change notification entirely.
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                Task { @MainActor in
+                    guard let self = self else { return }
+                    self.refreshTodayIfNeeded()
+                    self.currentMinute = Date().minuteOfDay
                 }
             }
             .store(in: &cancellables)
@@ -286,29 +377,57 @@ public final class CalendarSyncCoordinator: ObservableObject {
         positionedEventsByDayKey[date.dayKeyString] ?? []
     }
 
-    private func updatePositionedEvents() {
-        var grouped: [String: [CalendarEvent]] = [:]
-        for event in events where !event.isAllDay {
+    public func allDayEvents(for date: Date) -> [CalendarEvent] {
+        allDayEventsByDayKey[date.dayKeyString] ?? []
+    }
+
+    /// Buckets events by day once per sync so render passes only ever do a dictionary lookup —
+    /// no `Calendar` work, no filtering, no layout math while scrolling.
+    private func rebuildEventIndexes() {
+        var timed: [String: [CalendarEvent]] = [:]
+        var allDay: [String: [CalendarEvent]] = [:]
+
+        for event in events {
             let key = event.start.dayKeyString
-            grouped[key, default: []].append(event)
+            if event.isAllDay {
+                allDay[key, default: []].append(event)
+            } else {
+                timed[key, default: []].append(event)
+            }
         }
 
-        var result: [String: [PositionedEvent]] = [:]
-        for (key, dayEvs) in grouped {
-            result[key] = EventLayoutAlgorithm.layoutEvents(dayEvs)
+        var layouts: [String: [PositionedEvent]] = [:]
+        layouts.reserveCapacity(timed.count)
+        for (key, dayEvs) in timed {
+            layouts[key] = EventLayoutAlgorithm.layoutEvents(dayEvs)
         }
-        self.positionedEventsByDayKey = result
+
+        for key in allDay.keys {
+            allDay[key]?.sort { $0.summary.localizedStandardCompare($1.summary) == .orderedAscending }
+        }
+
+        self.positionedEventsByDayKey = layouts
+        self.allDayEventsByDayKey = allDay
     }
 
     // MARK: - Live Minute Clock (Active only when popover is open)
     private func startMinuteTimer() {
         minuteTimer?.invalidate()
-        minuteTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.currentMinute = Date().minuteOfDay
-                self?.onMenuBarTitleChanged?(self?.menuBarTitle ?? "")
+                guard let self = self else { return }
+                self.refreshTodayIfNeeded()
+                let minute = Date().minuteOfDay
+                if minute != self.currentMinute {
+                    self.currentMinute = minute
+                }
+                self.onMenuBarTitleChanged?(self.menuBarTitle)
             }
         }
+        timer.tolerance = 5
+        // .common keeps the clock ticking while the user is scrolling or dragging.
+        RunLoop.main.add(timer, forMode: .common)
+        minuteTimer = timer
     }
 
     private func stopMinuteTimer() {
@@ -318,23 +437,23 @@ public final class CalendarSyncCoordinator: ObservableObject {
 
     // MARK: - Navigation
     public func goToToday() {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            selectedDate = Date()
+        refreshTodayIfNeeded()
+        guard !isShowingToday else {
+            requestScrollToTarget()
+            return
         }
+        selectedDate = Date()
+        requestScrollToTarget()
     }
 
     public func nextPage() {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            let step = (viewMode == .day) ? 1 : 7
-            selectedDate = selectedDate.addingDays(step)
-        }
+        let step = (viewMode == .day) ? 1 : 7
+        selectedDate = selectedDate.addingDays(step)
     }
 
     public func prevPage() {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            let step = (viewMode == .day) ? 1 : 7
-            selectedDate = selectedDate.addingDays(-step)
-        }
+        let step = (viewMode == .day) ? 1 : 7
+        selectedDate = selectedDate.addingDays(-step)
     }
 
     // MARK: - Sync & Data
@@ -357,7 +476,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
             if eventKitService.hasAccess {
                 let fetchedCals = eventKitService.fetchCalendars()
                 syncCalendarSelectionState(newCalendars: fetchedCals)
-                await fetchEventsForCurrentRange()
+                await fetchEventsForCurrentRange(force: true)
                 lastSyncedAt = Date()
             } else {
                 statusMessage = "Calendar access not granted in macOS System Settings."
@@ -368,7 +487,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
                 do {
                     let fetchedCals = try await calendarService.fetchCalendarList(accessToken: token)
                     syncCalendarSelectionState(newCalendars: fetchedCals)
-                    await fetchEventsForCurrentRange()
+                    await fetchEventsForCurrentRange(force: true)
                     lastSyncedAt = Date()
                 } catch {
                     statusMessage = "Google sync error: \(error.localizedDescription)"
@@ -385,7 +504,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
         if let index = calendars.firstIndex(where: { $0.id == id }) {
             calendars[index].isSelected.toggle()
             saveSelectedCalendarIds()
-            Task { await fetchEventsForCurrentRange() }
+            Task { await fetchEventsForCurrentRange(force: true) }
         }
     }
 
@@ -405,8 +524,15 @@ public final class CalendarSyncCoordinator: ObservableObject {
         }
     }
 
-    public func fetchEventsForCurrentRange() async {
+    public func fetchEventsForCurrentRange(force: Bool = false) async {
         let range = dateRangeForCurrentView()
+
+        // Navigating day-to-day inside an already-fetched week is free: the range is identical,
+        // so skip the round trip entirely instead of re-querying on every arrow press.
+        if !force, let last = lastFetchedRange, last.start == range.start, last.end == range.end {
+            return
+        }
+
         let selectedCalendarIds = calendars.filter { $0.isSelected }.map { $0.id }
         let calColorMap = Dictionary(calendars.map { ($0.id, $0.colorHex) }, uniquingKeysWith: { first, _ in first })
 
@@ -450,6 +576,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
             return copy
         }
 
+        lastFetchedRange = range
         onMenuBarTitleChanged?(menuBarTitle)
     }
 
@@ -479,10 +606,37 @@ public final class CalendarSyncCoordinator: ObservableObject {
         return upcoming.first
     }
 
+    /// Timed meetings today that have not started yet. All-day events and anything already
+    /// in progress are excluded.
+    public var meetingsLeftToday: Int {
+        let now = Date()
+        return events.filter { !$0.isAllDay && $0.start > now && $0.start.isSameDay(as: now) }.count
+    }
+
+    /// Two-line title ("3\n45min"): meetings still to start today within the next 8 hours,
+    /// over the time until the first of them. Empty when there are none.
+    public var stackedMeetingsTitle: String {
+        let now = Date()
+        let horizon = now.addingTimeInterval(8 * 3600)
+        let upcoming = events
+            .filter { !$0.isAllDay && $0.start > now && $0.start <= horizon && $0.start.isSameDay(as: now) }
+            .sorted { $0.start < $1.start }
+        guard let next = upcoming.first else { return "" }
+
+        let minutes = max(1, Int((next.start.timeIntervalSince(now) / 60).rounded(.up)))
+        let until = minutes >= 60 ? "\(minutes / 60)hr" : "\(minutes)min"
+        return "\(upcoming.count)\n\(until)"
+    }
+
     public var menuBarTitle: String {
         switch menuBarDisplayMode {
         case .iconOnly:
             return ""
+        case .meetingsStacked:
+            return stackedMeetingsTitle
+        case .meetingsLeft:
+            let left = meetingsLeftToday
+            return left > 0 ? "\(left)" : ""
         case .iconWithDate:
             return Date().formattedDayNumber()
         case .nextEvent:
@@ -498,13 +652,34 @@ public final class CalendarSyncCoordinator: ObservableObject {
         }
     }
 
+    private var titleTimer: Timer?
+
+    /// The minute clock only runs while the popover is open, but the status bar count must
+    /// also tick over when a meeting starts with the popover closed.
+    private func startTitleTimer() {
+        titleTimer?.invalidate()
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.onMenuBarTitleChanged?(self.menuBarTitle)
+            }
+        }
+        timer.tolerance = 5
+        RunLoop.main.add(timer, forMode: .common)
+        titleTimer = timer
+    }
+
     private func restartTimer() {
         syncTimer?.invalidate()
         let seconds = TimeInterval(max(60, refreshIntervalMinutes * 60))
-        syncTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: seconds, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 await self?.refreshAll()
             }
         }
+        // Generous tolerance lets the system coalesce wake-ups for this background poll.
+        timer.tolerance = seconds * 0.15
+        RunLoop.main.add(timer, forMode: .common)
+        syncTimer = timer
     }
 }

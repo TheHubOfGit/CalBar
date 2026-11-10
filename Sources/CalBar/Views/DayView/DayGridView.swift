@@ -9,191 +9,156 @@ private struct DayScrollOffsetPreferenceKey: PreferenceKey {
 
 public struct DayGridView: View {
     @ObservedObject var coordinator: CalendarSyncCoordinator
+    /// The day this page renders. Fixed per page so the pager can show neighbouring days
+    /// side by side while the user is mid-swipe.
+    let date: Date
 
-    public init(coordinator: CalendarSyncCoordinator) {
+    private static let anchorPrefix = "day"
+
+    public init(coordinator: CalendarSyncCoordinator, date: Date) {
         self.coordinator = coordinator
+        self.date = date
     }
 
-    private var hourHeight: CGFloat {
-        coordinator.currentHourHeight
+    private var geometry: TimelineGeometry {
+        TimelineGeometry(coordinator: coordinator)
     }
 
-    private var startHour: Int {
-        coordinator.timelineStartHour
+    private var isToday: Bool {
+        date.isSameDay(as: coordinator.todayStart)
     }
 
-    private var endHour: Int {
-        coordinator.timelineEndHour
-    }
-
-    private var totalHours: Int {
-        coordinator.totalTimelineHours
-    }
-
-    private var topPadding: CGFloat {
-        coordinator.timelineTopPadding
-    }
-
-    private var bottomPadding: CGFloat {
-        coordinator.timelineBottomPadding
-    }
-
-    private var totalCanvasHeight: CGFloat {
-        coordinator.totalTimelineCanvasHeight
-    }
-
-    private var dayEvents: [CalendarEvent] {
-        coordinator.events.filter { event in
-            coordinator.selectedDate.isSameDay(as: event.start)
-        }
+    private var isPastDay: Bool {
+        date.startOfDay() < coordinator.todayStart
     }
 
     public var body: some View {
+        let geo = geometry
+
         VStack(spacing: 0) {
-            // All-Day Events Shelf
             AllDayEventsShelf(
-                events: dayEvents,
+                events: coordinator.allDayEvents(for: date),
                 blurRadius: coordinator.passedEventBlurRadius
             ) { selected in
-                coordinator.selectedEventForDetail = selected
+                coordinator.present(selected)
             }
 
-            // Scrollable Timeline
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: !coordinator.limitWorkingHours) {
                     HStack(alignment: .top, spacing: 0) {
-                        // Left: Time Gutter
                         TimeGutterView(
-                            hourHeight: hourHeight,
-                            startHour: startHour,
-                            endHour: endHour,
-                            topPadding: topPadding,
-                            bottomPadding: bottomPadding
+                            geometry: geo,
+                            highlightedHour: isToday ? Int(coordinator.currentMinute / 60.0) : nil
                         )
-                        .frame(width: 48)
 
-                        // Right: Events Canvas
-                        GeometryReader { geo in
-                            let canvasWidth = geo.size.width
-                            let startMinutes = Double(startHour * 60)
-                            let endMinutes = Double(endHour * 60)
-                            let positionedEvents = coordinator.positionedEvents(for: coordinator.selectedDate)
-
-                            ZStack(alignment: .topLeading) {
-                                // Background Hour Divider Lines
-                                HourGridLinesView(
-                                    hourHeight: hourHeight,
-                                    startHour: startHour,
-                                    endHour: endHour,
-                                    topPadding: topPadding,
-                                    bottomPadding: bottomPadding
-                                )
-
-                                // Vertical Divider between Gutter and Canvas
-                                Rectangle()
-                                    .fill(Color.primary.opacity(0.12))
-                                    .frame(width: 1)
-                                    .frame(height: totalCanvasHeight)
-
-                                // Positioned Timed Events
-                                ForEach(positionedEvents) { item in
-                                    let evStart = item.event.startMinuteOfDay
-                                    let evEnd = evStart + item.event.durationMinutes
-
-                                    if evStart < endMinutes && evEnd > startMinutes {
-                                        let availableWidth = canvasWidth - 8
-                                        let leftOffset = item.leftFraction * availableWidth + 3
-                                        let width = max(36, item.widthFraction * availableWidth - 2)
-
-                                        let clampedStart = max(startMinutes, evStart)
-                                        let clampedEnd = min(endMinutes, evEnd)
-                                        let rawTop = topPadding + ((clampedStart - startMinutes) / 60.0) * hourHeight
-                                        let rawBottom = topPadding + ((clampedEnd - startMinutes) / 60.0) * hourHeight
-                                        let height = max(20, rawBottom - rawTop)
-
-                                        TimedEventBlock(
-                                            event: item.event,
-                                            isPassed: coordinator.selectedDate < Date().startOfDay() || item.event.isPassed,
-                                            blurRadius: coordinator.passedEventBlurRadius
-                                        ) { selected in
-                                            coordinator.selectedEventForDetail = selected
-                                        }
-                                        .frame(width: width, height: height)
-                                        .offset(x: leftOffset, y: rawTop)
-                                    }
-                                }
-
-                                // Passed Time Shading Overlay
-                                if coordinator.shadePastTime {
-                                    if coordinator.selectedDate.isToday {
-                                        let currentMin = Date().minuteOfDay
-                                        if currentMin > startMinutes {
-                                            let elapsedHeight = min(CGFloat(totalHours) * hourHeight, CGFloat((currentMin - startMinutes) / 60.0) * hourHeight)
-                                            let shadeHeight = topPadding + elapsedHeight
-                                            Rectangle()
-                                                .fill(coordinator.pastTimeColor.color.opacity(coordinator.pastTimeOpacity))
-                                                .frame(width: canvasWidth, height: shadeHeight)
-                                                .allowsHitTesting(false)
-                                        }
-                                    } else if coordinator.selectedDate < Date().startOfDay() {
-                                        Rectangle()
-                                            .fill(coordinator.pastTimeColor.color.opacity(coordinator.pastTimeOpacity))
-                                            .frame(width: canvasWidth, height: totalCanvasHeight)
-                                            .allowsHitTesting(false)
-                                    }
-                                }
-
-                                // Live Current Time Indicator (rendered on top of shading)
-                                if coordinator.selectedDate.isToday {
-                                    CurrentTimeIndicator(
-                                        hourHeight: hourHeight,
-                                        totalWidth: canvasWidth,
-                                        startHour: startHour,
-                                        endHour: endHour,
-                                        topPadding: topPadding
-                                    )
-                                }
-
-                                // Scroll Anchors
-                                VStack(spacing: 0) {
-                                    Color.clear.frame(height: topPadding)
-                                    ForEach(startHour..<endHour, id: \.self) { hour in
-                                        Color.clear
-                                            .frame(height: hourHeight)
-                                            .id("day-hour-\(hour)")
-                                    }
-                                }
-                            }
-                            .frame(width: canvasWidth, height: totalCanvasHeight)
+                        GeometryReader { canvasGeo in
+                            canvas(width: canvasGeo.size.width, geo: geo)
                         }
                     }
-                    .frame(height: totalCanvasHeight)
-                    .background(
-                        GeometryReader { contentGeo in
-                            Color.clear.preference(
-                                key: DayScrollOffsetPreferenceKey.self,
-                                value: contentGeo.frame(in: .named("dayScrollArea")).minY
-                            )
-                        }
-                    )
+                    .frame(height: geo.totalHeight)
+                    .background(scrollOffsetReporter)
                 }
                 .coordinateSpace(name: "dayScrollArea")
                 .onPreferenceChange(DayScrollOffsetPreferenceKey.self) { minY in
-                    let scrolledOffset = -minY - topPadding
-                    if scrolledOffset > 0 {
-                        let approximateHour = startHour + Int(scrolledOffset / hourHeight)
-                        coordinator.lastScrollHour = max(startHour, min(endHour - 1, approximateHour))
+                    Task { @MainActor in
+                        recordScrollPosition(minY: minY, geo: geo)
                     }
                 }
                 .onAppear {
-                    let targetHour = coordinator.targetScrollHour(isToday: coordinator.selectedDate.isToday)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        withAnimation(.easeInOut(duration: 0.25)) {
-                            proxy.scrollTo("day-hour-\(targetHour)", anchor: .top)
-                        }
-                    }
+                    TimelineScroller.scrollSettling(proxy, prefix: Self.anchorPrefix, hour: targetHour)
+                }
+                .onChange(of: coordinator.scrollRequestToken) { _, _ in
+                    TimelineScroller.scroll(proxy, prefix: Self.anchorPrefix, hour: targetHour)
+                }
+                .onChange(of: geo) { _, _ in
+                    TimelineScroller.scrollSettling(proxy, prefix: Self.anchorPrefix, hour: targetHour)
                 }
             }
         }
+    }
+
+    private var targetHour: Int {
+        coordinator.targetScrollHour(isToday: isToday)
+    }
+
+    @ViewBuilder
+    private func canvas(width: CGFloat, geo: TimelineGeometry) -> some View {
+        let events = geo.layout(
+            coordinator.positionedEvents(for: date),
+            columnWidth: width,
+            metrics: .day
+        )
+
+        ZStack(alignment: .topLeading) {
+            HourGridLinesView(geometry: geo)
+
+            // Divider between the gutter and the canvas.
+            Rectangle()
+                .fill(Color.primary.opacity(0.12))
+                .frame(width: 1, height: geo.totalHeight)
+
+            ForEach(events) { item in
+                TimedEventBlock(
+                    event: item.event,
+                    isPassed: isPastDay || item.event.isPassed,
+                    blurRadius: coordinator.passedEventBlurRadius,
+                    size: item.frame.size
+                ) { selected in
+                    coordinator.present(selected)
+                }
+                .frame(width: item.frame.width, height: item.frame.height)
+                .offset(x: item.frame.minX, y: item.frame.minY)
+            }
+
+            if coordinator.shadePastTime, let extent = shadeExtent {
+                PastTimeShade(
+                    geometry: geo,
+                    width: width,
+                    extent: extent,
+                    color: coordinator.pastTimeColor.color,
+                    opacity: coordinator.pastTimeOpacity
+                )
+            }
+
+            if isToday {
+                CurrentTimeIndicator(
+                    geometry: geo,
+                    totalWidth: width,
+                    currentMinute: coordinator.currentMinute
+                )
+            }
+
+            TimelineScrollAnchors(geometry: geo, prefix: Self.anchorPrefix)
+        }
+        .frame(width: width, height: geo.totalHeight)
+    }
+
+    private var shadeExtent: PastTimeShade.Extent? {
+        if isToday { return .upTo(minute: coordinator.currentMinute) }
+        if isPastDay { return .fullDay }
+        return nil
+    }
+
+    /// Only installed for the "restore last position" behavior — the geometry reader and
+    /// preference plumbing it needs would otherwise run on every scrolled frame for nothing.
+    @ViewBuilder
+    private var scrollOffsetReporter: some View {
+        if coordinator.scrollBehavior == .retainPosition {
+            GeometryReader { contentGeo in
+                Color.clear.preference(
+                    key: DayScrollOffsetPreferenceKey.self,
+                    value: contentGeo.frame(in: .named("dayScrollArea")).minY
+                )
+            }
+        }
+    }
+
+    private func recordScrollPosition(minY: CGFloat, geo: TimelineGeometry) {
+        guard coordinator.scrollBehavior == .retainPosition,
+              date.isSameDay(as: coordinator.selectedDate) else { return }
+        let scrolled = -minY - geo.topPadding
+        guard scrolled > 0 else { return }
+        let hour = geo.startHour + Int(scrolled / geo.hourHeight)
+        coordinator.lastScrollHour = max(geo.startHour, min(geo.endHour - 1, hour))
     }
 }

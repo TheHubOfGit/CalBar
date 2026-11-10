@@ -10,249 +10,213 @@ private struct WeekScrollOffsetPreferenceKey: PreferenceKey {
 public struct WeekGridView: View {
     @ObservedObject var coordinator: CalendarSyncCoordinator
 
+    private static let anchorPrefix = "week"
+
     public init(coordinator: CalendarSyncCoordinator) {
         self.coordinator = coordinator
     }
 
-    private var hourHeight: CGFloat {
-        coordinator.currentHourHeight
-    }
-
-    private var startHour: Int {
-        coordinator.timelineStartHour
-    }
-
-    private var endHour: Int {
-        coordinator.timelineEndHour
-    }
-
-    private var totalHours: Int {
-        coordinator.totalTimelineHours
-    }
-
-    private var topPadding: CGFloat {
-        coordinator.timelineTopPadding
-    }
-
-    private var bottomPadding: CGFloat {
-        coordinator.timelineBottomPadding
-    }
-
-    private var totalCanvasHeight: CGFloat {
-        coordinator.totalTimelineCanvasHeight
+    private var geometry: TimelineGeometry {
+        TimelineGeometry(coordinator: coordinator)
     }
 
     private var weekDays: [Date] {
         coordinator.currentWeekDays
     }
 
-    private var allDayEvents: [CalendarEvent] {
-        coordinator.events.filter { $0.isAllDay }
-    }
-
     public var body: some View {
+        let geo = geometry
+        let days = weekDays
+
         VStack(spacing: 0) {
-            // Week Day Header (fixed 52pt height)
             WeekDayHeader(
-                days: weekDays,
-                selectedDate: coordinator.selectedDate
+                days: days,
+                selectedDate: coordinator.selectedDate,
+                todayStart: coordinator.todayStart
             ) { clickedDate in
                 coordinator.selectedDate = clickedDate
                 coordinator.viewMode = .day
+                coordinator.requestScrollToTarget()
             }
 
-            // All-Day Row for Week View (if any exist)
-            if !allDayEvents.isEmpty {
-                HStack(alignment: .center, spacing: 0) {
-                    Text("all-day")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(.secondary)
-                        .frame(width: 48, alignment: .trailing)
-                        .padding(.trailing, 6)
+            allDayRow(days: days)
 
-                    HStack(spacing: 0) {
-                        ForEach(weekDays, id: \.self) { day in
-                            let dayAllDay = allDayEvents.filter { day.isSameDay(as: $0.start) }
-                            VStack(spacing: 2) {
-                                ForEach(dayAllDay) { ev in
-                                    WeekAllDayChip(
-                                        event: ev,
-                                        isPassed: day < Date().startOfDay(),
-                                        blurRadius: coordinator.passedEventBlurRadius
-                                    ) {
-                                        coordinator.selectedEventForDetail = ev
-                                    }
-                                }
-                            }
-                            .padding(.horizontal, 2)
-                            .frame(maxWidth: .infinity)
-                        }
-                    }
-                }
-                .padding(.vertical, 4)
-                .background(Color.primary.opacity(0.02))
-                .overlay(Divider(), alignment: .bottom)
-            }
-
-            // Scrollable Week Grid
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: !coordinator.limitWorkingHours) {
                     HStack(alignment: .top, spacing: 0) {
-                        // Left: Time Gutter
                         TimeGutterView(
-                            hourHeight: hourHeight,
-                            startHour: startHour,
-                            endHour: endHour,
-                            topPadding: topPadding,
-                            bottomPadding: bottomPadding
+                            geometry: geo,
+                            highlightedHour: coordinator.weekContainsToday ? Int(coordinator.currentMinute / 60.0) : nil
                         )
-                        .frame(width: 48)
 
-                        // Right: Week day columns
-                        GeometryReader { geo in
-                            let totalWidth = geo.size.width
-                            let columnWidth = totalWidth / CGFloat(max(1, weekDays.count))
-                            let startMinutes = Double(startHour * 60)
-                            let endMinutes = Double(endHour * 60)
-                            let todayStart = Date().startOfDay()
-
-                            ZStack(alignment: .topLeading) {
-                                // Background hour lines
-                                HourGridLinesView(
-                                    hourHeight: hourHeight,
-                                    startHour: startHour,
-                                    endHour: endHour,
-                                    topPadding: topPadding,
-                                    bottomPadding: bottomPadding
-                                )
-
-                                // 7 Columns
-                                HStack(spacing: 0) {
-                                    ForEach(Array(weekDays.enumerated()), id: \.offset) { index, day in
-                                        let positionedEvents = coordinator.positionedEvents(for: day)
-                                        let isToday = day.isToday
-                                        let isPastDay = day < todayStart
-
-                                        ZStack(alignment: .topLeading) {
-                                            // Vertical column border
-                                            Rectangle()
-                                                .fill(Color.primary.opacity(0.12))
-                                                .frame(width: 1)
-                                                .frame(height: totalCanvasHeight)
-
-                                            // Events
-                                            ForEach(positionedEvents) { item in
-                                                let evStart = item.event.startMinuteOfDay
-                                                let evEnd = evStart + item.event.durationMinutes
-
-                                                if evStart < endMinutes && evEnd > startMinutes {
-                                                    let availableColWidth = columnWidth - 5
-                                                    let clampedStart = max(startMinutes, evStart)
-                                                    let clampedEnd = min(endMinutes, evEnd)
-                                                    let rawTop = topPadding + ((clampedStart - startMinutes) / 60.0) * hourHeight
-                                                    let rawBottom = topPadding + ((clampedEnd - startMinutes) / 60.0) * hourHeight
-                                                    let height = max(18, rawBottom - rawTop)
-                                                    let leftOffset = item.leftFraction * availableColWidth + 2.5
-                                                    let width = max(16, item.widthFraction * availableColWidth - 1.5)
-
-                                                    TimedEventBlock(
-                                                        event: item.event,
-                                                        isPassed: isPastDay || item.event.isPassed,
-                                                        blurRadius: coordinator.passedEventBlurRadius
-                                                    ) { selected in
-                                                        coordinator.selectedEventForDetail = selected
-                                                    }
-                                                    .frame(width: width, height: height)
-                                                    .offset(x: leftOffset, y: rawTop)
-                                                }
-                                            }
-
-                                            // Passed Time Shading Overlay for this column
-                                            if coordinator.shadePastTime {
-                                                if isPastDay {
-                                                    // Entire day in the past
-                                                    Rectangle()
-                                                        .fill(coordinator.pastTimeColor.color.opacity(coordinator.pastTimeOpacity))
-                                                        .frame(width: columnWidth, height: totalCanvasHeight)
-                                                        .allowsHitTesting(false)
-                                                } else if isToday {
-                                                    // Today up to the current minute
-                                                    let currentMin = Date().minuteOfDay
-                                                    if currentMin > startMinutes {
-                                                        let elapsedHeight = min(CGFloat(totalHours) * hourHeight, CGFloat((currentMin - startMinutes) / 60.0) * hourHeight)
-                                                        let shadeHeight = topPadding + elapsedHeight
-                                                        Rectangle()
-                                                            .fill(coordinator.pastTimeColor.color.opacity(coordinator.pastTimeOpacity))
-                                                            .frame(width: columnWidth, height: shadeHeight)
-                                                            .allowsHitTesting(false)
-                                                    }
-                                                }
-                                            }
-
-                                            // Current time indicator line on today's column with dot
-                                            if isToday {
-                                                let currentMin = Date().minuteOfDay
-                                                if currentMin >= startMinutes && currentMin <= endMinutes {
-                                                    let yOffset = topPadding + ((currentMin - startMinutes) / 60.0) * hourHeight
-                                                    ZStack(alignment: .topLeading) {
-                                                        Rectangle()
-                                                            .fill(GooglePalette.googleRed)
-                                                            .frame(width: columnWidth, height: 1.5)
-
-                                                        Circle()
-                                                            .fill(GooglePalette.googleRed)
-                                                            .frame(width: 6, height: 6)
-                                                            .offset(x: -3, y: -2.25)
-                                                    }
-                                                    .offset(y: yOffset)
-                                                }
-                                            }
-                                        }
-                                        .frame(width: columnWidth, height: totalCanvasHeight)
-                                    }
-                                }
-
-                                // Scroll Anchors
-                                VStack(spacing: 0) {
-                                    Color.clear.frame(height: topPadding)
-                                    ForEach(startHour..<endHour, id: \.self) { hour in
-                                        Color.clear
-                                            .frame(height: hourHeight)
-                                            .id("week-hour-\(hour)")
-                                    }
-                                }
-                            }
-                            .frame(width: totalWidth, height: totalCanvasHeight)
+                        GeometryReader { canvasGeo in
+                            canvas(width: canvasGeo.size.width, days: days, geo: geo)
                         }
                     }
-                    .frame(height: totalCanvasHeight)
-                    .background(
-                        GeometryReader { contentGeo in
-                            Color.clear.preference(
-                                key: WeekScrollOffsetPreferenceKey.self,
-                                value: contentGeo.frame(in: .named("weekScrollArea")).minY
-                            )
-                        }
-                    )
+                    .frame(height: geo.totalHeight)
+                    .background(scrollOffsetReporter)
                 }
                 .coordinateSpace(name: "weekScrollArea")
                 .onPreferenceChange(WeekScrollOffsetPreferenceKey.self) { minY in
-                    let scrolledOffset = -minY - topPadding
-                    if scrolledOffset > 0 {
-                        let approximateHour = startHour + Int(scrolledOffset / hourHeight)
-                        coordinator.lastScrollHour = max(startHour, min(endHour - 1, approximateHour))
+                    Task { @MainActor in
+                        recordScrollPosition(minY: minY, geo: geo)
                     }
                 }
                 .onAppear {
-                    let targetHour = coordinator.targetScrollHour(isToday: true)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        withAnimation(.easeInOut(duration: 0.25)) {
-                            proxy.scrollTo("week-hour-\(targetHour)", anchor: .top)
-                        }
-                    }
+                    TimelineScroller.scrollSettling(proxy, prefix: Self.anchorPrefix, hour: targetHour)
+                }
+                .onChange(of: coordinator.scrollRequestToken) { _, _ in
+                    TimelineScroller.scroll(proxy, prefix: Self.anchorPrefix, hour: targetHour)
+                }
+                .onChange(of: geo) { _, _ in
+                    TimelineScroller.scrollSettling(proxy, prefix: Self.anchorPrefix, hour: targetHour)
                 }
             }
         }
+    }
+
+    private var targetHour: Int {
+        coordinator.targetScrollHour(isToday: coordinator.weekContainsToday)
+    }
+
+    // MARK: - All-day row
+
+    @ViewBuilder
+    private func allDayRow(days: [Date]) -> some View {
+        let perDay = days.map { coordinator.allDayEvents(for: $0) }
+
+        if perDay.contains(where: { !$0.isEmpty }) {
+            HStack(alignment: .top, spacing: 0) {
+                Text("all-day")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .frame(width: TimelineGeometry.gutterWidth, alignment: .trailing)
+                    .padding(.trailing, 6)
+
+                HStack(alignment: .top, spacing: 0) {
+                    ForEach(Array(zip(days, perDay)), id: \.0) { day, events in
+                        VStack(spacing: 2) {
+                            ForEach(events) { event in
+                                WeekAllDayChip(
+                                    event: event,
+                                    isPassed: day < coordinator.todayStart,
+                                    blurRadius: coordinator.passedEventBlurRadius
+                                ) {
+                                    coordinator.present(event)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 2)
+                        .frame(maxWidth: .infinity, alignment: .top)
+                    }
+                }
+            }
+            .padding(.vertical, 4)
+            .background(Color.primary.opacity(0.02))
+            .overlay(Divider(), alignment: .bottom)
+        }
+    }
+
+    // MARK: - Timeline canvas
+
+    @ViewBuilder
+    private func canvas(width: CGFloat, days: [Date], geo: TimelineGeometry) -> some View {
+        let columnWidth = width / CGFloat(max(1, days.count))
+
+        ZStack(alignment: .topLeading) {
+            HourGridLinesView(geometry: geo)
+
+            HStack(spacing: 0) {
+                ForEach(days, id: \.self) { day in
+                    column(day: day, width: columnWidth, geo: geo)
+                        .frame(width: columnWidth, height: geo.totalHeight)
+                }
+            }
+
+            TimelineScrollAnchors(geometry: geo, prefix: Self.anchorPrefix)
+        }
+        .frame(width: width, height: geo.totalHeight)
+    }
+
+    @ViewBuilder
+    private func column(day: Date, width: CGFloat, geo: TimelineGeometry) -> some View {
+        let isToday = day.isSameDay(as: coordinator.todayStart)
+        let isPastDay = day < coordinator.todayStart
+        let events = geo.layout(
+            coordinator.positionedEvents(for: day),
+            columnWidth: width,
+            metrics: .week
+        )
+
+        ZStack(alignment: .topLeading) {
+            if isToday {
+                Rectangle()
+                    .fill(GooglePalette.googleBlue.opacity(0.045))
+                    .frame(width: width, height: geo.totalHeight)
+                    .allowsHitTesting(false)
+            }
+
+            Rectangle()
+                .fill(Color.primary.opacity(0.12))
+                .frame(width: 1, height: geo.totalHeight)
+
+            ForEach(events) { item in
+                TimedEventBlock(
+                    event: item.event,
+                    isPassed: isPastDay || item.event.isPassed,
+                    blurRadius: coordinator.passedEventBlurRadius,
+                    size: item.frame.size
+                ) { selected in
+                    coordinator.present(selected)
+                }
+                .frame(width: item.frame.width, height: item.frame.height)
+                .offset(x: item.frame.minX, y: item.frame.minY)
+            }
+
+            if coordinator.shadePastTime, let extent = shadeExtent(isToday: isToday, isPastDay: isPastDay) {
+                PastTimeShade(
+                    geometry: geo,
+                    width: width,
+                    extent: extent,
+                    color: coordinator.pastTimeColor.color,
+                    opacity: coordinator.pastTimeOpacity
+                )
+            }
+
+            if isToday {
+                CurrentTimeIndicator(
+                    geometry: geo,
+                    totalWidth: width,
+                    currentMinute: coordinator.currentMinute
+                )
+            }
+        }
+    }
+
+    private func shadeExtent(isToday: Bool, isPastDay: Bool) -> PastTimeShade.Extent? {
+        if isPastDay { return .fullDay }
+        if isToday { return .upTo(minute: coordinator.currentMinute) }
+        return nil
+    }
+
+    @ViewBuilder
+    private var scrollOffsetReporter: some View {
+        if coordinator.scrollBehavior == .retainPosition {
+            GeometryReader { contentGeo in
+                Color.clear.preference(
+                    key: WeekScrollOffsetPreferenceKey.self,
+                    value: contentGeo.frame(in: .named("weekScrollArea")).minY
+                )
+            }
+        }
+    }
+
+    private func recordScrollPosition(minY: CGFloat, geo: TimelineGeometry) {
+        guard coordinator.scrollBehavior == .retainPosition else { return }
+        let scrolled = -minY - geo.topPadding
+        guard scrolled > 0 else { return }
+        let hour = geo.startHour + Int(scrolled / geo.hourHeight)
+        coordinator.lastScrollHour = max(geo.startHour, min(geo.endHour - 1, hour))
     }
 }
 
@@ -261,6 +225,8 @@ private struct WeekAllDayChip: View {
     let isPassed: Bool
     let blurRadius: CGFloat
     let onTap: () -> Void
+
+    @State private var isHovered = false
 
     var body: some View {
         Button(action: onTap) {
@@ -271,12 +237,12 @@ private struct WeekAllDayChip: View {
                 .padding(.horizontal, 4)
                 .padding(.vertical, 2)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .background(event.resolvedColor)
-                .cornerRadius(3)
-                .blur(radius: isPassed ? blurRadius : 0)
-                .clipShape(RoundedRectangle(cornerRadius: 3))
+                .background(event.resolvedColor, in: RoundedRectangle(cornerRadius: 3, style: .continuous))
+                .pastEventTreatment(isPassed: isPassed && !isHovered, blurRadius: blurRadius)
+                .contentShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
         }
         .buttonStyle(.plain)
+        .onHover { isHovered = $0 }
+        .help(event.summary)
     }
 }
-

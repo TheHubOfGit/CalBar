@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import SwiftUI
 import Combine
 
@@ -60,25 +61,35 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
             self?.updatePopoverSize(newSize)
         }
 
-        Publishers.CombineLatest4(coordinator.$viewMode, coordinator.$limitWorkingHours, coordinator.$timelineDensity, coordinator.$events)
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                guard let self = self else { return }
-                self.updatePopoverSize(self.coordinator.desiredPopoverSize())
-            }
-            .store(in: &cancellables)
-
-        coordinator.$onlyShowWeekdays
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                guard let self = self else { return }
-                self.updatePopoverSize(self.coordinator.desiredPopoverSize())
-            }
-            .store(in: &cancellables)
+        // Only geometry-affecting preferences resize the popover. Event arrivals deliberately
+        // do not: resizing mid-sync made the window visibly jump on every refresh.
+        Publishers.CombineLatest4(
+            coordinator.$viewMode,
+            coordinator.$limitWorkingHours,
+            coordinator.$timelineDensity,
+            coordinator.$onlyShowWeekdays
+        )
+        .map { [weak self] _ in self?.coordinator.desiredPopoverSize() ?? .zero }
+        .removeDuplicates()
+        .receive(on: RunLoop.main)
+        .sink { [weak self] size in
+            self?.updatePopoverSize(size, animated: true)
+        }
+        .store(in: &cancellables)
     }
 
-    private func updatePopoverSize(_ size: NSSize) {
-        if popover.contentSize != size {
+    private func updatePopoverSize(_ size: NSSize, animated: Bool = false) {
+        guard popover.contentSize != size else { return }
+
+        guard animated, popover.isShown else {
+            popover.contentSize = size
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.22
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            context.allowsImplicitAnimation = true
             popover.contentSize = size
         }
     }
@@ -86,8 +97,22 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     private func updateTitle(_ text: String) {
         guard let button = statusItem.button else { return }
         if text.isEmpty {
+            button.attributedTitle = NSAttributedString(string: "")
             button.title = ""
+        } else if text.contains("\n") {
+            // Stacked two-line title: compact, tightly spaced, centered over each other.
+            let style = NSMutableParagraphStyle()
+            style.alignment = .center
+            style.maximumLineHeight = 10
+            style.minimumLineHeight = 10
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium),
+                .paragraphStyle: style,
+                .baselineOffset: -0.5,
+            ]
+            button.attributedTitle = NSAttributedString(string: " " + text.replacingOccurrences(of: "\n", with: "\n "), attributes: attributes)
         } else {
+            button.attributedTitle = NSAttributedString(string: "")
             button.title = " " + text
         }
     }
@@ -98,6 +123,9 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
         if popover.isShown {
             popover.performClose(sender)
         } else {
+            // Snap to the current day and re-anchor the timeline *before* the first paint so the
+            // popover opens already showing today at the right scroll position.
+            coordinator.prepareForPopoverPresentation()
             updatePopoverSize(coordinator.desiredPopoverSize())
             NSApp.activate(ignoringOtherApps: true)
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -137,11 +165,14 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
 
     // MARK: - NSPopoverDelegate
     public func popoverWillShow(_ notification: Notification) {
+        // Idempotent safety net for shows that don't go through `togglePopover`.
+        coordinator.prepareForPopoverPresentation()
         coordinator.isPopoverVisible = true
     }
 
     public func popoverDidClose(_ notification: Notification) {
         coordinator.isPopoverVisible = false
+        coordinator.selectedEventForDetail = nil
     }
 }
 

@@ -43,7 +43,47 @@ public enum GooglePalette {
     }
 }
 
+/// Resolved-color memo.
+///
+/// `Color(hex:)` allocates a `Scanner` and walks the string every time it runs, and event
+/// chips ask for their color on every render pass. The set of distinct calendar colors is
+/// tiny, so caching turns a per-frame parse into a dictionary hit.
+final class ResolvedColorCache: @unchecked Sendable {
+    static let shared = ResolvedColorCache()
+
+    private let lock = NSLock()
+    private var colors: [String: Color] = [:]
+    private var darkness: [String: Bool] = [:]
+
+    func color(for hex: String) -> Color {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = colors[hex] { return cached }
+        let resolved = Color(hex: hex)
+        colors[hex] = resolved
+        return resolved
+    }
+
+    func isDark(_ hex: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = darkness[hex] { return cached }
+        let resolved = Color.isColorDark(hex: hex)
+        darkness[hex] = resolved
+        return resolved
+    }
+}
+
 extension Color {
+    /// Memoized counterpart to `Color(hex:)` for use on render-hot paths.
+    public static func cached(hex: String) -> Color {
+        ResolvedColorCache.shared.color(for: hex)
+    }
+
+    public static func isColorDarkCached(hex: String) -> Bool {
+        ResolvedColorCache.shared.isDark(hex)
+    }
+
     public init(hex: String) {
         var cleaned = hex.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleaned.hasPrefix("#") {

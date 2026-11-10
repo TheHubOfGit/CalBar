@@ -71,11 +71,11 @@ public struct CalendarEvent: Identifiable, Codable, Hashable, Sendable {
     }
 
     public var resolvedColor: Color {
-        Color(hex: resolvedHex)
+        Color.cached(hex: resolvedHex)
     }
 
     public var contrastTextColor: Color {
-        Color.isColorDark(hex: resolvedHex) ? .white : Color(white: 0.12)
+        Color.isColorDarkCached(hex: resolvedHex) ? .white : Color(white: 0.12)
     }
 
     public var timeRangeString: String {
