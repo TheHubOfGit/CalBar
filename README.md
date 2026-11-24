@@ -1,4 +1,4 @@
-# CalBar 📅
+# <img src="AppIcon_1024.png" width="44" height="44" align="absmiddle" alt="CalBar icon" /> CalBar
 > A sleek, native macOS menu bar app bringing Google Calendar Day and Week views right to your status bar.
 
 ![macOS](https://img.shields.io/badge/macOS-14.0%2B-blue)
