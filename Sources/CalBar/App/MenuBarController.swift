@@ -10,6 +10,7 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
     private var settingsWindow: NSWindow?
     private let coordinator = CalendarSyncCoordinator.shared
     private var cancellables = Set<AnyCancellable>()
+    private var iconImage: NSImage?
 
     public override init() {
         super.init()
@@ -25,6 +26,7 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
             let imageConfig = NSImage.SymbolConfiguration(pointSize: 13, weight: .regular)
             let image = NSImage(systemSymbolName: "calendar", accessibilityDescription: "CalBar")?.withSymbolConfiguration(imageConfig)
             image?.isTemplate = true
+            iconImage = image
             button.image = image
             button.imagePosition = .imageLeft
             button.target = self
@@ -96,25 +98,56 @@ public final class MenuBarController: NSObject, NSPopoverDelegate {
 
     private func updateTitle(_ text: String) {
         guard let button = statusItem.button else { return }
-        if text.isEmpty {
-            button.attributedTitle = NSAttributedString(string: "")
+        button.attributedTitle = NSAttributedString(string: "")
+        if text.contains("\n") {
+            // Stacked two-line title, drawn into one template image (icon + both lines) so the
+            // lines can span the full menu bar height instead of fighting the button's own
+            // vertical text centering.
             button.title = ""
-        } else if text.contains("\n") {
-            // Stacked two-line title: compact, tightly spaced, centered over each other.
-            let style = NSMutableParagraphStyle()
-            style.alignment = .center
-            style.maximumLineHeight = 10
-            style.minimumLineHeight = 10
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .medium),
-                .paragraphStyle: style,
-                .baselineOffset: -0.5,
-            ]
-            button.attributedTitle = NSAttributedString(string: " " + text.replacingOccurrences(of: "\n", with: "\n "), attributes: attributes)
+            button.imagePosition = .imageOnly
+            button.image = Self.stackedImage(icon: iconImage, text: text)
         } else {
-            button.attributedTitle = NSAttributedString(string: "")
-            button.title = " " + text
+            button.image = iconImage
+            button.imagePosition = .imageLeft
+            button.title = text.isEmpty ? "" : " " + text
         }
+    }
+
+    private static func stackedImage(icon: NSImage?, text: String) -> NSImage {
+        let lines = text.components(separatedBy: "\n")
+        let top = lines.first ?? ""
+        let bottom = lines.count > 1 ? lines[1] : ""
+        let height: CGFloat = 22
+        let iconSize = icon?.size ?? .zero
+        let gap: CGFloat = 5
+
+        let topFont = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        let bottomFont = NSFont.systemFont(ofSize: 10, weight: .medium)
+        func attributed(_ string: String, _ font: NSFont) -> NSAttributedString {
+            NSAttributedString(string: string, attributes: [.font: font, .foregroundColor: NSColor.black])
+        }
+        let topText = attributed(top, topFont)
+        let bottomText = attributed(bottom, bottomFont)
+        let textWidth = ceil(max(topText.size().width, bottomText.size().width))
+        let width = iconSize.width + gap + textWidth
+
+        let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
+            if let icon {
+                icon.draw(in: NSRect(x: 0, y: (height - iconSize.height) / 2, width: iconSize.width, height: iconSize.height))
+            }
+            // Pin each line's baseline near its edge: cap tops sit ~2pt below the top and the
+            // bottom baseline sits ~2pt above the bottom, using the whole bar.
+            let textX = iconSize.width + gap
+            let topBaseline = height - 2.5 - topFont.capHeight
+            let bottomBaseline: CGFloat = 2.5
+            let topX = textX + (textWidth - topText.size().width) / 2
+            let bottomX = textX + (textWidth - bottomText.size().width) / 2
+            topText.draw(at: NSPoint(x: topX, y: topBaseline + topFont.descender))
+            bottomText.draw(at: NSPoint(x: bottomX, y: bottomBaseline + bottomFont.descender))
+            return true
+        }
+        image.isTemplate = true
+        return image
     }
 
     @objc private func togglePopover(_ sender: AnyObject?) {

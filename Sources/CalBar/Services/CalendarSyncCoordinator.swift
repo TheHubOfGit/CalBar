@@ -613,7 +613,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
         return events.filter { !$0.isAllDay && $0.start > now && $0.start.isSameDay(as: now) }.count
     }
 
-    /// Two-line title ("3\n45min"): meetings still to start today within the next 8 hours,
+    /// Two-line title ("3 left\n45min"): meetings still to start today within the next 8 hours,
     /// over the time until the first of them. Empty when there are none.
     public var stackedMeetingsTitle: String {
         let now = Date()
@@ -625,7 +625,7 @@ public final class CalendarSyncCoordinator: ObservableObject {
 
         let minutes = max(1, Int((next.start.timeIntervalSince(now) / 60).rounded(.up)))
         let until = minutes >= 60 ? "\(minutes / 60)hr" : "\(minutes)min"
-        return "\(upcoming.count)\n\(until)"
+        return "\(upcoming.count) left\n\(until)"
     }
 
     public var menuBarTitle: String {
